@@ -30,7 +30,7 @@ extern void S3_Conv2d_64x32x3x3_MaxPool_2x2_Relu(
 		unsigned char * __restrict__ Scale,
 		unsigned char * __restrict__ ScaleN,
 		signed char * __restrict__ Infos);
-extern void S4_Linear_3x26x26x64(
+extern void S4_Linear_3x29x39x64(
 		signed char * __restrict__ In,
 		signed char * __restrict__ Filter,
 		int * __restrict__ Bias,

@@ -1,3 +1,4 @@
+// model.c
 /*
  * Copyright (C) 2017 GreenWaves Technologies
  * All rights reserved.
@@ -18,6 +19,10 @@
 // modelLernels.h 是 GenTile 自动生成的文件之一，和神经网络有关
 #include "modelKernels.h"
 #include "gaplib/ImgIO.h"
+#include "img_proc.h"
+#include "bsp/buffer.h"
+#include "bsp/ai_deck.h"
+#include "bsp/camera/himax.h"
 
 
 #define pmsis_exit(n) exit(n)
@@ -41,6 +46,18 @@ L2_MEM unsigned char *Img_In;
 // AT_INPUT_WIDTH AT_INPUT_HEIGHT AT_INPUT_COLORS 均在 Makefile 中定义
 #define AT_INPUT_SIZE (AT_INPUT_WIDTH*AT_INPUT_HEIGHT*AT_INPUT_COLORS)
 #define AT_INPUT_SIZE_BYTES (AT_INPUT_SIZE*sizeof(char))
+#define CLASS_NUM 3
+
+////////////////////////////////////////////////////////////////
+#define QVGA_MODE
+#define COLOR_IMAGE
+static struct pi_device camera;
+PI_L2 unsigned char *buff;
+
+#define BUFF_SIZE (AT_INPUT_WIDTH*AT_INPUT_HEIGHT)
+#define NB_FRAMES -1
+
+////////////////////////////////////////////////////////////////
 //#define PRINT_IMAGE
 
 char *ImageName = NULL;
@@ -49,19 +66,19 @@ char *ImageName = NULL;
 
 static void cluster()
 {
-  printf("Running on cluster\n");
+  //printf("Running on cluster\n");
 #ifdef PERF
-  printf("Start timer\n");
-  gap_cl_starttimer();
-  gap_cl_resethwtimer();
+  //printf("Start timer\n");
+  //gap_cl_starttimer();
+  //gap_cl_resethwtimer();
 #endif
   modelCNN(Img_In, ResOut);
-  printf("Runner completed\n");
+  //printf("Runner completed\n");
 
   //Checki Results
   int rec_digit = 0;
   short int highest = ResOut[0];
-  for(int i = 0; i < 3; i++) {
+  for(int i = 0; i < CLASS_NUM; i++) {
     printf("class %d: %d \n", i, ResOut[i]);
     if(ResOut[i] > highest) {
       highest = ResOut[i];
@@ -69,9 +86,46 @@ static void cluster()
     }
   }
   printf("\n");
-
-  printf("Recognized: %d\n", rec_digit);
+  if(rec_digit==0)printf("Recognized: part_ripe\n");
+  if(rec_digit==1)printf("Recognized: ripe\n");
+  if(rec_digit==2)printf("Recognized: unripe\n");
+  //printf("Recognized: %d\n", rec_digit);
 }
+
+static int open_camera(struct pi_device *device)
+{
+    printf("Opening Himax camera\n");
+    struct pi_himax_conf cam_conf;
+    pi_himax_conf_init(&cam_conf);
+
+#if defined(QVGA_MODE)
+    cam_conf.format = PI_CAMERA_QVGA;
+#endif
+
+    pi_open_from_conf(device, &cam_conf);
+    if (pi_camera_open(device))
+        return -1;
+
+    // Rotate camera orientation
+    pi_camera_control(&camera, PI_CAMERA_CMD_START, 0);
+    uint8_t set_value = 3;
+    uint8_t reg_value;
+
+    pi_camera_reg_set(&camera, IMG_ORIENTATION, &set_value);
+    pi_time_wait_us(1000000);
+    pi_camera_reg_get(&camera, IMG_ORIENTATION, &reg_value);
+    if (set_value!=reg_value)
+    {
+        printf("Failed to rotate camera image\n");
+        return -1;
+    }
+    pi_camera_control(&camera, PI_CAMERA_CMD_STOP, 0);
+
+    pi_camera_control(device, PI_CAMERA_CMD_AEG_INIT, 0);
+
+    return 0;
+}
+
 
 int test_model(void)
 {
@@ -87,34 +141,35 @@ int test_model(void)
       printf("Image buffer alloc Error!\n");
       pmsis_exit(-1);
     } 
-
-    char *ImageName = __XSTR(AT_IMAGE);
-
-    if (ReadImageFromFile(ImageName, AT_INPUT_WIDTH, AT_INPUT_HEIGHT, AT_INPUT_COLORS, Img_In, AT_INPUT_SIZE_BYTES, IMGIO_OUTPUT_CHAR, 0))
+    // 打开摄像头
+    if (open_camera(&camera))
     {
-        printf("Failed to load image %s\n", ImageName);
-        pmsis_exit(-2);
+        printf("Failed to open camera\n");
+        pmsis_exit(-1);
     }
+    
+    // 调试QVGA模式
+    uint8_t set_value = 0;
+    uint8_t reg_value = 0;
 
-#if defined(PRINT_IMAGE)
-    for (int i=0; i<AT_INPUT_HEIGHT; i++)
-    {
-        for (int j=0; j<AT_INPUT_WIDTH; j++)
-        {
-            printf("%03d, ", Img_In[AT_INPUT_WIDTH*i + j]);
-        }
-        printf("\n");
-    }
-#endif  /* PRINT_IMAGE */
-
-    ResOut = (short int *) AT_L2_ALLOC(0, 3 * sizeof(short int));
-    if (ResOut == NULL)
-    {
-        printf("Failed to allocate Memory for Result (%d bytes)\n", 3 *sizeof(short int));
-        pmsis_exit(-3);
-    }
-
-    /* Configure And open cluster. */
+    #ifdef QVGA_MODE
+    set_value=1;
+    pi_camera_reg_set(&camera, QVGA_WIN_EN, &set_value);
+    pi_camera_reg_get(&camera, QVGA_WIN_EN, &reg_value);
+    printf("qvga window enabled %d\n",reg_value);
+    #endif
+    
+    // 测试同步拍摄
+    set_value=0;                                                                                                                                          
+    pi_camera_reg_set(&camera, VSYNC_HSYNC_PIXEL_SHIFT_EN, &set_value);
+    pi_camera_reg_get(&camera, VSYNC_HSYNC_PIXEL_SHIFT_EN, &reg_value);
+    printf("vsync hsync pixel shift enabled %d\n",reg_value);
+    
+    // 分配拍摄缓存
+    buff = (unsigned char *) AT_L2_ALLOC(0, BUFF_SIZE);
+    if (buff == NULL){ return -1;}
+    
+    // 配置和打开cluster
     struct pi_device cluster_dev;
     struct pi_cluster_conf cl_conf;
     cl_conf.id = 0;
@@ -125,8 +180,19 @@ int test_model(void)
         pmsis_exit(-4);
     }
 
+    // 为识别结果分配空间
+    ResOut = (short int *) AT_L2_ALLOC(0, CLASS_NUM * sizeof(short int));
+    if (ResOut == NULL)
+    {
+        printf("Failed to allocate Memory for Result (%d bytes)\n", CLASS_NUM *sizeof(short int));
+        pmsis_exit(-3);
+    }
+
+    
+
     printf("Constructor\n");
     // IMPORTANT - MUST BE CALLED AFTER THE CLUSTER IS SWITCHED ON!!!!
+    // 构造CNN
     if (modelCNN_Construct())
     {
         printf("Graph constructor exited with an error\n");
@@ -139,30 +205,37 @@ int test_model(void)
     task.arg = NULL;
     task.stack_size = (unsigned int) STACK_SIZE;
     task.slave_stack_size = (unsigned int) SLAVE_STACK_SIZE;
+    int nb_frames = 0;
+    while(1 && (NB_FRAMES == -1 || nb_frames < NB_FRAMES)) {
+            //拍摄图片
+           pi_camera_control(&camera, PI_CAMERA_CMD_START, 0);
+            pi_camera_capture(&camera, buff, BUFF_SIZE);
+            pi_camera_control(&camera, PI_CAMERA_CMD_STOP, 0);
+            
+            //转换彩色图片
+        demosaicking(buff, Img_In, AT_INPUT_WIDTH, AT_INPUT_HEIGHT, 0);
+            // cluster执行任务
+            pi_cluster_send_task_to_cl(&cluster_dev, &task);
+            
+            nb_frames++;
+    }
+    
 
-    pi_cluster_send_task_to_cl(&cluster_dev, &task);
 
+    // 析构CNN
     modelCNN_Destruct();
 
-#ifdef PERF
-    {
-      unsigned int TotalCycles = 0, TotalOper = 0;
-      printf("\n");
-      for (int i=0; i<(sizeof(AT_GraphPerf)/sizeof(unsigned int)); i++) {
-        printf("%45s: Cycles: %10d, Operations: %10d, Operations/Cycle: %f\n", AT_GraphNodeNames[i], AT_GraphPerf[i], AT_GraphOperInfosNames[i], ((float) AT_GraphOperInfosNames[i])/ AT_GraphPerf[i]);
-        TotalCycles += AT_GraphPerf[i]; TotalOper += AT_GraphOperInfosNames[i];
-      }
-      printf("\n");
-      printf("%45s: Cycles: %10d, Operations: %10d, Operations/Cycle: %f\n", "Total", TotalCycles, TotalOper, ((float) TotalOper)/ TotalCycles);
-      printf("\n");
-    }
-#endif
+    // 关闭摄像头
+    pi_camera_control(&camera, PI_CAMERA_CMD_STOP, 0);
+    pi_camera_close(&camera);
 
     // Close the cluster
     pi_cluster_close(&cluster_dev);
 
     AT_L2_FREE(0, Img_In, AT_INPUT_SIZE_BYTES);
-    AT_L2_FREE(0, ResOut, 3 * sizeof(short int));
+    AT_L2_FREE(0, buff, BUFF_SIZE);
+    AT_L2_FREE(0, ResOut, CLASS_NUM * sizeof(short int));
+    
     printf("Ended\n");
 
     pmsis_exit(0);
@@ -174,3 +247,4 @@ int main()
     printf("\n\n\t *** NNTOOL model Example ***\n\n");
     return pmsis_kickoff((void *) test_model);
 }
+
